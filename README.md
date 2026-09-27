@@ -140,4 +140,4 @@ The obvious move is to combine the three: use the differentiable-solver core fro
 - Test whether β actually responds to lockdown stringency at the district level, since the national average washes it out.
 - Swap the k-NN graph for real mobility flow data.
 
-Issues and suggestions are welcome.
+<img width="1178" height="4422" alt="mermaid-diagram (1)" src="https://github.com/user-attachments/assets/28fac813-8d57-4028-b185-607ec6883e93" />
