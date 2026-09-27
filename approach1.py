@@ -456,7 +456,7 @@ plt.savefig(os.path.join(OUT_DIR, 'classical_ode_vs_data_average.png'), dpi=150)
 plt.show()
 
 
-# %% [14] SUMMARY ----------------------------------------------------------------------
+# %% [13] SUMMARY ----------------------------------------------------------------------
 print('=' * 70)
 print('SUMMARY — PLAIN SIR-PINN')
 print('=' * 70)
