@@ -1,0 +1,188 @@
+Technical Report: SEIR Physics-Informed Neural Network (PINN) Training Pipeline
+1. Purpose and High-Level Summary
+This script trains a Physics-Informed Neural Network (PINN) to model COVID-19 epidemic dynamics across Indian districts using an SEIR (Susceptible–Exposed–Infected–Recovered) compartmental model. Rather than fitting a classical ODE solver to noisy case data, the approach uses two coupled neural networks per time-domain:
+StateNet — learns the epidemic state trajectory (S, E, I, R) as a continuous function of time t and spatial coordinates (x, y).
+ParamNet — learns the (potentially time/region-varying) epidemic parameters (beta, sigma, gamma) — transmission rate, incubation rate, recovery rate — as a function of contextual features (policy stringency, population density, case velocity/acceleration, regime signals).
+The two networks are tied together by physics residual losses derived from the SEIR ODE system, computed via automatic differentiation at randomly sampled "collocation points," plus data-fitting losses at the actual observed time series and boundary-continuity losses across adjacent time sub-domains. This is a classic PINN formulation, extended with domain decomposition (splitting a long time series into ~30-day chunks, each with its own pair of networks) to handle the long time horizon and abrupt regime changes typical of epidemic curves.
+After training, a separate RK4 (Runge-Kutta 4th order) numerical integration step forward-simulates the SEIR system using only the learned ParamNet outputs, to sanity-check whether the learned parameters actually reproduce a plausible epidemic trajectory when integrated forward — independent of the trained StateNet.
+
+2. Data Pipeline (Sections 0–17.5)
+The preprocessing pipeline transforms a raw Google-mobility/Oxford-stringency-style COVID dataset into per-district training tensors.
+Stage
+What it does
+Load & cleanup
+Drops all-NaN columns and constant-value columns.
+State-size filter
+Keeps only states/subregions with ≥10,000 rows (enough temporal density).
+Date parsing & coordinate encoding
+Normalizes latitude/longitude to [-1, 1] (x, y) and date to [0, 1] (t), based on the global min/max across the filtered dataset. T_DAYS captures the real-world span in days.
+District-level slice
+Keeps only aggregation_level == 2 (district-level) rows, sorted by (location_key, date).
+Column pruning
+Drops wikidata_id, any new_* (daily-delta) columns, and age-related columns — the model works purely off cumulative counts and static/contextual covariates.
+Population density
+population / area_sq_km, with missing/zero values imputed by the median.
+Policy aggregation
+Five Oxford-style ordinal policy columns (school/workplace closures, event cancellation, gathering restrictions, transport closures) are summed into a single sum_of_restrictions scalar.
+Stringency imputation
+Missing district-level stringency is backfilled from the state-level mean stringency, with a final global-mean fallback.
+Compartment construction
+R = cumulative_recovered + cumulative_deceased (deaths are folded into "removed"), I = cumulative_confirmed − R (clipped ≥0), S = population − I − R (clipped ≥0). All three are divided by population to get fractional compartments in [0, 1].
+Forward-fill
+Cumulative counts are forward-filled per district to handle missing reporting days, then residual NaNs zeroed.
+Feature engineering (calculate_epidemic_dynamics)
+Computes: velocity (dI/dt) and acceleration (d²I/dt²), each median-smoothed over a 7-day centered window; a wavelet-based spike detector (pywt, Symlet-5, 3-level DWT) that flags sudden discontinuities in the I curve; a regime signal (tanh of acceleration, saturating near "flat" regions); a spike signal (sigmoid of `
+Compartment smoothing
+7-day centered median filter applied to S, I, R to denoise reporting artifacts.
+Chronological split
+Per-district 70/15/15 train/val/test split in time order (not random) — essential for a time-series forecasting setup to avoid leakage.
+Feature scaling
+MinMaxScaler fit only on df_train, applied to val/test — standard practice to avoid data leakage from the future.
+Tensor construction
+Converts to torch.float32 tensors: t, x, y, an 8-dimensional parameter-feature vector (x, y, stringency_smooth, pop_density, velocity, acceleration, regime_signal, spike_signal), and 3-dimensional targets (S, I, R).
+Curvature-biased collocation weighting
+build_colloc_curvature_weights computes a per-row sampling weight proportional to the numerical gradient of I over t (curvature), so that later collocation-point sampling (sample_colloc_t) oversamples time regions where the epidemic curve is changing fastest — a common PINN trick to concentrate physics-residual pressure where the dynamics are hardest to fit, blended 70/30 with uniform random sampling and Gaussian jitter for smoothness.
+
+
+3. Domain Decomposition Strategy
+Because a single global time-continuous network struggles to fit an epidemic curve spanning many waves and regime shifts, the script partitions each district's timeline into N_DOMAINS ≈ T_DAYS / 30 sequential ~30-day chunks (SUBDOMAIN_LENGTH_DAYS = 30). Each domain gets:
+Its own StateNet (network capacity dedicated to a short, locally-simple segment of the curve).
+Its own ParamNet (see Modification #7 below).
+A 10% time overlap (OVERLAP_FRAC) with the previous domain, used purely to construct a boundary-continuity loss: the current domain's StateNet prediction at the shared overlap region is compared against the previous domain's StateNet prediction at the same real times, encouraging the piecewise trajectory to connect smoothly rather than jump discontinuously at domain edges.
+Domains are round-robin assigned across available GPUs (domain_devices[k] = DEVICES[k % len(DEVICES)]) to parallelize a multi-GPU box.
+All domains for a given district are trained jointly in a single epoch loop (looping k in range(N_DOMAINS) inside each epoch), with gradients accumulated and a shared optimizer stepping once per epoch, but with two independently-clipped parameter groups (ParamNet pool vs. StateNet pool).
+
+4. Network Architectures
+StateNet
+Linear(3→64) → Tanh → Linear(64→128) → Tanh → Linear(128→128) → Tanh
+→ Linear(128→64) → Tanh → Linear(64→4) → Sigmoid
+
+Input: (t, x, y). Output: 4 values in (0,1) interpreted as (S, E, I, R) — note the E (Exposed) compartment is inferred purely from the physics residual loss, since the raw dataset only supplies S, I, R targets (there's no observed "exposed" count).
+ParamNet
+Linear(n_param_inputs→64) → Tanh → Linear(64→3) → Softplus
+
+Input: the 8-dim contextual feature vector. Output: (beta, sigma, gamma), scaled by fixed multipliers (×2.0, ×0.5, ×0.5) to roughly calibrate the expected order of magnitude of each epidemiological rate. This final activation was changed from Sigmoid to Softplus — a key bugfix discussed below.
+
+5. Physics Residuals (SEIR ODE Consistency)
+At randomly sampled collocation points (t_c, x_c, y_c), the script:
+Queries StateNet to get (S, E, I, R) and computes ∂S/∂t, ∂E/∂t, ∂I/∂t, ∂R/∂t via torch.autograd.grad (true automatic differentiation, not finite differences), scaled by dt_scale to compensate for the [-1, 1] time normalization per domain.
+Queries ParamNet to get (beta, sigma, gamma) at the same points (using the contextual feature vector p_c, resampled with replacement from the domain's real rows since contextual features aren't defined on arbitrary collocation points).
+Computes seven residuals via seir_residuals:
+Four ODE residuals: dS − (−βSI), dE − (βSI − σE), dI − (σE − γI), dR − γI → aggregated into loss_ode.
+Three algebraic/conservation residuals: total-population conservation (dS+dE+dI+dR ≈ 0), an R-consistency check (dR − γI, duplicated), and an E-consistency check → aggregated into loss_alg.
+This is the mechanism that lets the network learn beta/sigma/gamma without ever observing them directly — gradients flow backward from how well the SEIR ODE is satisfied.
+
+6. Loss Function
+loss_total = weights['data']     * loss_data
+           + weights['ode']      * loss_ode
+           + weights['alg']      * loss_alg
+           + weights['boundary'] * loss_boundary
+
+loss_data: relative squared error between StateNet's (S, I, R) outputs and true targets, (pred − true)/(true + ε) — a relative rather than absolute error, chosen because S, I, R span many orders of magnitude (I can be ~1e-6 early in an outbreak).
+loss_boundary: relative squared error between the current domain's StateNet and the previous domain's StateNet, evaluated at the shared overlap window (continuity constraint).
+loss_ode / loss_alg: as above.
+The fixed weights data = boundary = 1e5, with ode/alg starting at 0 and ramped up during training (see below) — a weighted/annealed multi-objective PINN loss, a standard technique to prevent the physics loss from dominating before the network has learned any reasonable state trajectory at all.
+
+7. Training Loop Mechanics
+Optimizer: single Adam instance with two parameter groups — pooled ParamNet parameters at PARAM_NET_LR = 1e-2, pooled StateNet parameters at LR = 1e-3. Both groups are pooled across all domains (not per-domain optimizers), but each group gets its own clip_grad_norm_(..., max_norm=1.0) call, decoupling ParamNet's gradient scale from StateNet's.
+Warmup: for the first WARMUP_EPOCHS = 1000 epochs, ode/alg weights are held at 0 and all ParamNet parameters are frozen (requires_grad_(False)) — the StateNet first learns to fit the raw data alone before the physics constraint (and the parameter network) engages.
+Post-warmup ramp: starting exactly at epoch == WARMUP_EPOCHS, ode/alg weights jump to 1.0 and then linearly ramp from 1.0 up to ODE_ALG_TARGET_WEIGHT = 1e5 over ODE_ALG_RAMP_EPOCHS = 1000 additional epochs (mirroring the earlier, now-removed, RK4-weight ramp pattern — see Modification #11 below).
+Collocation sampling: per epoch, per domain, N_colloc = min(8000, 5 × domain_row_count) new points are drawn (curvature-biased in time, uniform in x, y), and a fresh batch of contextual feature rows is resampled (with replacement) to pair with them.
+Checkpointing/logging cadence: every CHECKPOINT_INTERVAL = 500 epochs (plus the final epoch), losses are pulled to CPU via .item() and a full checkpoint (state_net, param_net, optimizer state) is saved to disk per domain. This is deliberately not every epoch, because per-epoch .item() calls force GPU→CPU synchronization (~5×N_DOMAINS times/epoch) and disk writes were a major bottleneck (see Modification "CHECKPOINT_INTERVAL" note in config).
+Post-loop diagnostics: three read-only reporting functions run once, after all epochs finish (Modification #12, below).
+
+8. Post-Training Diagnostics (New in this version — Modification #12)
+Three functions run at the end of train_district, purely for inspection (no effect on training):
+report_learned_params — prints per-domain mean±std of learned (beta, sigma, gamma) over that domain's own training rows. Useful for catching e.g. gamma collapsing to ≈0 (which would explain a flat R curve in the RK4 rollout).
+report_state_net_fit — prints per-domain and overall MSE/MAE of StateNet(t,x,y) vs. true (S,I,R), with no ODE integration involved — isolates "does the network fit the raw data" from "is the learned dynamics self-consistent."
+plot_state_net_fit — the plotting counterpart, stitching all domains together in real time order (using the newly reintroduced t_raw field) to show a single true-vs-predicted curve across the whole district.
+The diagnostic rationale is explicit in the code: if report_state_net_fit looks good but the RK4 rollout (Section 9 below) still looks bad, the fault lies in the learned ODE parameters / physics consistency, not in the StateNet's raw curve-fitting.
+
+9. Post-Hoc RK4 Rollout Evaluation (Section 8 of the code)
+Independent of the training loop, once training finishes, the script:
+Builds np.interp-based interpolators for each contextual feature over the district's full real timeline (build_param_interpolators).
+Gets an initial condition (S0, E0, I0, R0) by querying the appropriate domain's trained StateNet at t0 (get_initial_state).
+Forward-integrates the SEIR ODE with classical RK4, querying the appropriate domain's ParamNet (via _select_domain_model, which does a searchsorted over domain_edges) at each of the four RK4 stage times to get (beta, sigma, gamma), independent of StateNet from that point on.
+Interpolates the fine RK4 trajectory back onto the original observation timestamps and compares against true S/I/R via plot_rk4_simulation.
+This provides an "unrolled," fully-mechanistic epidemic forecast driven only by the learned parameter function — a much stronger test of whether the learned (beta, sigma, gamma) are physically meaningful than the ODE-residual loss alone, since RK4 integration compounds any parameter error over the whole horizon.
+
+10. Multi-GPU Handling
+NUM_GPUS = torch.cuda.device_count() determines a DEVICES list; domains are assigned round-robin (k % len(DEVICES)), so on an N-GPU box, different ~30-day chunks of the same district can train on different physical GPUs simultaneously. This introduces cross-device bookkeeping throughout: boundary losses must move the previous domain's prediction to the current domain's device (.to(domain_device)), and the RK4 rollout must resolve which physical device a given ParamNet lives on before building input tensors (see Modification #10).
+
+11. Chronology of Modifications (as documented in the script's own docstring)
+This is the most information-dense part of the header — a full audit trail of iterative debugging. Below is a structured walkthrough, in the order the comments present them, with the underlying engineering reasoning made explicit.
+Environment migration (Mods 1–4)
+Originally a Colab notebook against Google Drive; adapted to route data/checkpoints through Drive with per-epoch checkpointing and periodic RK4 diagnostic plots during training (this Kaggle version further reroutes to /kaggle/input/... and /kaggle/working/).
+Mod 5 — Removing AMP (mixed precision)
+Problem: torch.cuda.amp autocast + GradScaler were used originally, but the loss formulation divides by targets that can be as small as ~1e-6 and multiplies by loss weights on the order of 1e5 — this overflowed fp16's representable range. GradScaler silently skips optimizer.step() whenever unscale_() detects inf/nan, so the practical failure mode was a training loop that ran, printed progress, and checkpointed normally, while silently never updating any weights — an insidious, hard-to-detect bug. Fix: train fully in fp32, unconditionally, with no scaler.
+Mod 6 — Two optimizer parameter groups (superseded structurally by Mod 7)
+Split the single Adam/single-clip call into a ParamNet group and a StateNet group, each with independent LR and gradient clipping — because StateNet gets large direct gradients from the 1e5-weighted data/boundary MSE, while ParamNet only gets gradient through the long, thin ODE-residual path, so sharing an LR/clip budget under-served ParamNet.
+Mod 7 — Per-domain ParamNet (was previously a single shared network)
+Reasoning: since the RK4 rollout is only ever evaluated on the district's own train set (no cross-domain generalization is required — each domain only ever sees its own p_c rows), there is no benefit to forcing one shared beta/sigma/gamma mapping across all ~30-day chunks. Switching to one ParamNet per domain is strictly more expressive (each domain's transmission dynamics can differ freely) at the explicit cost of losing cross-domain parameter-sharing regularization — nothing ties one domain's dynamics to the next's anymore. All per-domain ParamNet parameters remain pooled into one optimizer group and one clip_grad_norm_ call.
+Mod 8 — RK4 weight ramp (later fully superseded by Mod 9)
+Problem diagnosed: at epoch == WARMUP_EPOCHS, three things happened simultaneously: ode/alg weights jumped 0→1 (small step), rk4 weight jumped 0 → 1e5 (a 5-order-of-magnitude step), and ParamNet was unfrozen in that same instant. The huge, instantaneous jump onto parameters that had never received a gradient before caused a training stall exactly at epoch 1000 — visible as Data/Boundary losses flatlining while ODE/Alg losses kept moving. Fix at the time: keep ode/alg jumping straight to 1.0 as before, but make rk4 ramp linearly from 0 to RK4_TARGET_WEIGHT over RK4_RAMP_EPOCHS instead of jumping instantly.
+Mod 9 — Full removal of the RK4 training loss
+The entire RK4-rollout loss term was later removed from the training objective: the 'rk4' weight entry, RK4_TARGET_WEIGHT/RK4_RAMP_EPOCHS and its ramp schedule, loss_rk4 inside compute_loss, and the helper functions that only existed to support it (simulate_rk4_trajectory, seir_derivatives_rk4, rk4_step_forward), plus the purely diagnostic during-training RK4 logging/plotting (compute_train_rk4_loss, plot_train_rk4_loss_history, plot_rk4_train_snapshot, train_rk4_loss_history). Total training loss is now simply data + ode + alg + boundary. Note: ParamNet is still unfrozen at WARMUP_EPOCHS, because loss_ode alone still needs a live gradient path into it — that need was never specific to RK4. The post-training RK4 simulation (Section 9 above) is untouched — it's a separate, post-hoc evaluation, not part of the loss.
+Mod 10 — Multi-GPU device-mismatch bugfix in the post-training RK4 rollout
+Symptom: RuntimeError: Expected all tensors to be on the same device, but got mat1 is on cuda:0, different from other tensors on cuda:1. Root cause: with NUM_GPUS ≥ 2, different domains' ParamNets can live on different physical GPUs (round-robin assignment). query_param_net correctly resolves which ParamNet to use for a given query time via _select_domain_model, but it was building its input tensor on the single global device argument passed down from the top of the call chain (run_rk4_simulations_for_district → simulate_district_rk4 → rk4_step → query_param_net) — i.e., whichever device the first domain happened to train on. Once the RK4 rollout's advancing t_query crossed into a later domain whose ParamNet lived on a different CUDA index, the Linear layer's weight matrix and input tensor ended up on different GPUs. Fix: a single, targeted change — build p_t on param_net's own device (via _net_device) inside query_param_net, after resolving which ParamNet applies, rather than on the passed-in device. Nothing else in rk4_step, simulate_district_rk4, or get_initial_state changes (the latter still legitimately uses the global device for the initial StateNet query, since that call happens once at the start on a device the caller controls).
+Mod 11 — ODE/Alg weight ramp bugfix
+Diagnosis: ParamNet is the only network with a gradient path to beta/sigma/gamma, and that path runs exclusively through loss_ode/loss_alg. At WARMUP_EPOCHS, those weights jumped straight to 1.0 and stayed there for the rest of training, while data/boundary sat at 1e5. Both parameter groups are clipped to max_norm = 1.0, but clipping only caps gradients already above that threshold — it cannot boost gradients that are already small. With ode/alg fixed at weight 1.0, ParamNet's raw gradient norm consistently sat well under the clip threshold, so ParamNet's higher LR (1e-2) was mostly multiplying a near-zero gradient by a bigger number and still producing a near-zero step. Net effect: ParamNet barely trained at all; beta/sigma/gamma stayed near wherever random initialization (and, compoundingly, sigmoid saturation — see Mod 13) left them. Fix: reuse the same linear-ramp pattern that had fixed the earlier RK4-weight instability (Mod 8) — after the WARMUP_EPOCHS jump to 1.0 (unchanged), ramp ode/alg weights linearly up to ODE_ALG_TARGET_WEIGHT = 1e5 over ODE_ALG_RAMP_EPOCHS epochs. The target is deliberately set below the data/boundary weight — the goal is only to push ParamNet's raw gradient reliably above the clipping threshold (so its updates become consistent, clip-bounded steps like StateNet's already are), not to let physics loss dominate or swamp the data fit. A gradual ramp (rather than a jump) avoids re-introducing a sudden large-step shock to ParamNet right as it's unfrozen — the same instability class as Mod 8.
+Mod 13 — ParamNet output activation: Sigmoid → Softplus
+Diagnosis: even after the Mod 11 ramp fix, learned beta/gamma were still pinned exactly at the min/max of their sigmoid-scaled range (0.0000 or 2.0000 for beta; 0.0000 or 0.5000 for gamma) in most domains, with near-zero within-domain standard deviation — despite the domain's own contextual features (stringency, pop_density, velocity, acceleration, regime/spike signals) genuinely varying. This is the classic signature of sigmoid saturation: once the now-larger ode/alg gradient (from Mod 11) pushed a pre-activation far enough into the sigmoid's flat tail, the local derivative of the sigmoid collapses toward zero, so subsequent gradient steps through that unit become vanishingly small regardless of the upstream loss weight — the unit gets stuck at whichever saturated corner it first reached and stops responding to its inputs. Fix: replace ParamNet's final nn.Sigmoid() with nn.Softplus(). Softplus is monotonic, strictly positive everywhere, and its gradient decays only exponentially toward (never exactly reaching) zero as the pre-activation goes very negative — it has no flat, exactly-zero-gradient region at either tail the way Sigmoid does at both ends. Trade-off made explicit in the comments: Softplus is unbounded above rather than hard-capped, so beta/sigma/gamma are no longer hard-clamped to [0,2]/[0,0.5]/[0,0.5] — but they also can no longer get permanently stuck exactly at those old boundary values. The ×2.0/×0.5/×0.5 scale multipliers are kept unchanged, now functioning as soft scale factors rather than hard ceilings, to keep the outputs at roughly their previously-tuned order of magnitude. Nothing else about how ParamNet's output is consumed downstream changes.
+Mod 12 — see Section 8 above (post-training diagnostics).
+
+12. Summary Table of Key Hyperparameters
+Parameter
+Value
+Role
+SUBDOMAIN_LENGTH_DAYS
+30
+Length of each time-domain chunk
+EPOCHS_PER_DOMAIN
+7,000
+Total training epochs (all domains trained jointly, per epoch)
+WARMUP_EPOCHS
+1,000
+Epochs before physics loss/ParamNet engage
+ODE_ALG_RAMP_EPOCHS
+1,000
+Epochs over which ode/alg weight ramps to target
+ODE_ALG_TARGET_WEIGHT
+1e5
+Ceiling for ramped ode/alg weight (data/boundary reference)
+OVERLAP_FRAC
+0.10
+Fractional time overlap between adjacent domains
+N_COLLOC_MAX
+8,000
+Max collocation points per domain per epoch
+COLLOC_CURVATURE_FRAC
+0.7
+Fraction of collocation points biased toward high-curvature time regions
+LR (StateNet)
+1e-3
+Adam learning rate, StateNet group
+PARAM_NET_LR
+1e-2
+Adam learning rate, ParamNet group (10× higher)
+CHECKPOINT_INTERVAL
+500
+Epoch interval for logging/checkpointing
+INIT_WEIGHTS
+data=1e5, boundary=1e5, ode=alg=0.0
+Initial loss weights before ramp
+Gradient clip
+max_norm=1.0
+Applied separately to ParamNet pool and StateNet pool
+
+
+13. Overall Assessment
+The script represents a mature, iteratively-hardened PINN pipeline for SEIR parameter/state estimation from real epidemiological data, with several non-trivial engineering lessons baked into its structure:
+Precision management: recognizing that relative-error losses with 1e5-scale weights are fundamentally incompatible with fp16 autocast, rather than fighting it with scaler tuning.
+Optimization dynamics of coupled networks: recognizing that a shared LR/clip budget systematically starves a "downstream," thin-gradient-path network (ParamNet) relative to one receiving large direct supervision (StateNet), and that loss-weight ramping — not just learning-rate tuning — is required to get a frozen-then-unfrozen network's gradients reliably above a fixed clipping threshold.
+Activation-choice diagnosis: correctly distinguishing "the network converged to a degenerate constant" from "the network is regularized/constrained," by inspecting within-domain output variance, and tracing it to the specific saturating nonlinearity responsible.
+Separation of concerns in evaluation: explicitly designing diagnostics (report_state_net_fit vs. the RK4 rollout) that can localize which of the two coupled networks is at fault when the end-to-end rollout looks wrong.
+Distributed-tensor-placement bugs: a classic "which device does this tensor belong to" bug that only manifests once training is parallelized across ≥2 GPUs and a query point crosses a domain boundary — fixed with a minimal, localized change rather than a broader refactor.
+One area not addressed in the current version: the loss of cross-domain parameter regularization introduced by Mod 7 (per-domain ParamNets) is acknowledged as a deliberate trade-off but not mitigated (e.g., no soft-tying loss between adjacent domains' ParamNet outputs at the boundary, analogous to the existing StateNet boundary loss) — so beta/sigma/gamma could in principle jump discontinuously across the 30-day domain edges even though the state trajectory is explicitly constrained to be continuous there.
+
+
